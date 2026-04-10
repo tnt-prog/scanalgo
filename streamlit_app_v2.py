@@ -49,6 +49,27 @@ DEFAULT_CONFIG: dict = {
     "use_vol_spike":      False,
     "vol_spike_mult":     2.0,
     "vol_spike_lookback": 20,
+    # ── Chandelier Exit (F12) ─────────────────────────────────────────────────
+    "use_ce":             False,
+    "ce_length":          22,
+    "ce_mult":            3.0,
+    "ce_3m":              False,
+    "ce_5m":              True,
+    "ce_15m":             True,
+    # ── Classic SuperTrend (F13) ──────────────────────────────────────────────
+    "use_st":             False,
+    "st_period":          10,
+    "st_mult":            3.0,
+    "st_3m":              False,
+    "st_5m":              True,
+    "st_15m":             True,
+    # ── Lux / UAlgo Trend Signals (F14) ──────────────────────────────────────
+    "use_lux":            False,
+    "lux_mult":           2.0,
+    "lux_atr_period":     14,
+    "lux_3m":             False,
+    "lux_5m":             True,
+    "lux_15m":            True,
     "watchlist": [
         "PTBUSDT","SANTOSUSDT","XRPUSDT","HEMIUSDT","OGUSDT","SIRENUSDT",
         "BANUSDT","BASUSDT","4USDT","MAGMAUSDT","XANUSDT","TRIAUSDT",
@@ -457,6 +478,149 @@ def calc_parabolic_sar(candles: list, af_start: float = 0.02,
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ATR helper (Wilder RMA — used by CE, SuperTrend, Lux)
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_atr(candles: list, period: int) -> list:
+    """
+    Wilder's ATR (RMA smoothing). Returns a list the same length as candles.
+    Positions without enough history are None.
+    """
+    result = [None] * len(candles)
+    if len(candles) < period + 1:
+        return result
+    trs = [None]
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) > period:
+        seed = sum(trs[1:period+1]) / period
+        result[period] = seed
+        atr_val = seed
+        for i in range(period + 1, len(candles)):
+            atr_val = (atr_val * (period - 1) + trs[i]) / period
+            result[i] = atr_val
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F12 — Chandelier Exit
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_chandelier_exit(candles: list, length: int = 22, mult: float = 3.0,
+                         use_close: bool = True) -> list:
+    """
+    Chandelier Exit per candle.
+    Returns list of (long_stop, short_stop, dir) where dir: 1=bullish, -1=bearish.
+    """
+    atr_series = calc_atr(candles, length)
+    result = []
+    long_stop_prev = short_stop_prev = None
+    dir_val = 1
+    for i in range(len(candles)):
+        atr_val = atr_series[i]
+        if atr_val is None:
+            result.append((None, None, dir_val))
+            continue
+        window = candles[i - length + 1: i + 1]
+        if use_close:
+            extreme_high = max(c["close"] for c in window)
+            extreme_low  = min(c["close"] for c in window)
+        else:
+            extreme_high = max(c["high"] for c in window)
+            extreme_low  = min(c["low"]  for c in window)
+        atr = mult * atr_val
+        long_stop  = extreme_high - atr
+        short_stop = extreme_low  + atr
+        if long_stop_prev is not None:
+            prev_close = candles[i-1]["close"]
+            if prev_close > long_stop_prev:
+                long_stop  = max(long_stop,  long_stop_prev)
+            if prev_close < short_stop_prev:
+                short_stop = min(short_stop, short_stop_prev)
+            curr_close = candles[i]["close"]
+            if   curr_close > short_stop_prev: dir_val =  1
+            elif curr_close < long_stop_prev:  dir_val = -1
+        long_stop_prev  = long_stop
+        short_stop_prev = short_stop
+        result.append((long_stop, short_stop, dir_val))
+    return result
+
+def ce_bullish(candles: list, length: int = 22, mult: float = 3.0) -> bool:
+    """True if Chandelier Exit is bullish on the last candle."""
+    res = calc_chandelier_exit(candles, length, mult)
+    return bool(res) and res[-1][2] == 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F13 — Classic SuperTrend
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_supertrend(candles: list, period: int = 10, multiplier: float = 3.0) -> list:
+    """
+    Classic SuperTrend per candle.
+    Returns list of (trend, up_band, dn_band); trend: 1=bullish, -1=bearish.
+    """
+    atr_series = calc_atr(candles, period)
+    result = []
+    up_prev = dn_prev = None
+    trend = 1
+    for i in range(len(candles)):
+        atr_val = atr_series[i]
+        src = (candles[i]["high"] + candles[i]["low"]) / 2  # hl2
+        if atr_val is None:
+            result.append((trend, None, None))
+            continue
+        up = src - multiplier * atr_val
+        dn = src + multiplier * atr_val
+        if up_prev is not None:
+            prev_close = candles[i-1]["close"]
+            if prev_close > up_prev: up = max(up, up_prev)
+            if prev_close < dn_prev: dn = min(dn, dn_prev)
+            curr_close = candles[i]["close"]
+            if   trend == -1 and curr_close > dn_prev: trend =  1
+            elif trend ==  1 and curr_close < up_prev: trend = -1
+        up_prev, dn_prev = up, dn
+        result.append((trend, up, dn))
+    return result
+
+def supertrend_bullish(candles: list, period: int = 10, multiplier: float = 3.0) -> bool:
+    """True if SuperTrend is bullish on the last candle."""
+    res = calc_supertrend(candles, period, multiplier)
+    return bool(res) and res[-1][0] == 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F14 — Lux / UAlgo Trend Signals
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_lux_trend(candles: list, multiplier: float = 2.0, atr_period: int = 14) -> list:
+    """
+    Lux/UAlgo SuperTrend-style trend direction (the primary trend component).
+    Returns list of trend values (1=bullish, -1=bearish).
+    """
+    atr_series = calc_atr(candles, atr_period)
+    result = []
+    up_prev = dn_prev = None
+    trend = 1
+    for i in range(len(candles)):
+        atr_val = atr_series[i]
+        src = (candles[i]["high"] + candles[i]["low"]) / 2
+        if atr_val is None:
+            result.append(trend)
+            continue
+        up = src - multiplier * atr_val
+        dn = src + multiplier * atr_val
+        if up_prev is not None:
+            prev_close = candles[i-1]["close"]
+            if prev_close > up_prev: up = max(up, up_prev)
+            if prev_close < dn_prev: dn = min(dn, dn_prev)
+            curr_close = candles[i]["close"]
+            if   trend == -1 and curr_close > dn_prev: trend =  1
+            elif trend ==  1 and curr_close < up_prev: trend = -1
+        up_prev, dn_prev = up, dn
+        result.append(trend)
+    return result
+
+def lux_trend_bullish(candles: list, multiplier: float = 2.0, atr_period: int = 14) -> bool:
+    """True if Lux/UAlgo trend is bullish on the last candle."""
+    res = calc_lux_trend(candles, multiplier, atr_period)
+    return bool(res) and res[-1] == 1
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Core filter logic
 # ─────────────────────────────────────────────────────────────────────────────
 def _reset_filter_counts():
@@ -471,6 +635,9 @@ def _reset_filter_counts():
         "f9_macd":    0,
         "f10_sar":    0,
         "f11_vol":    0,
+        "f12_ce":     0,
+        "f13_st":     0,
+        "f14_lux":    0,
         "passed":     0,
         "errors":     0,
     }
@@ -581,6 +748,51 @@ def process(sym, cfg: dict):
                 if avg_vol <= 0 or last_vol < mult * avg_vol:
                     with _filter_lock: _filter_counts["f11_vol"] = _filter_counts.get("f11_vol", 0) + 1
                     return None
+
+        # ── F12 — Chandelier Exit (per selected timeframes) ───────────────────
+        if cfg.get("use_ce", False):
+            ce_len  = int(cfg.get("ce_length", 22))
+            ce_mult = float(cfg.get("ce_mult", 3.0))
+            failed = False
+            if cfg.get("ce_3m", False) and not ce_bullish(m3_candles, ce_len, ce_mult):
+                failed = True
+            if not failed and cfg.get("ce_5m", True) and not ce_bullish(m5, ce_len, ce_mult):
+                failed = True
+            if not failed and cfg.get("ce_15m", True) and not ce_bullish(m15, ce_len, ce_mult):
+                failed = True
+            if failed:
+                with _filter_lock: _filter_counts["f12_ce"] = _filter_counts.get("f12_ce", 0) + 1
+                return None
+
+        # ── F13 — Classic SuperTrend (per selected timeframes) ────────────────
+        if cfg.get("use_st", False):
+            st_per  = int(cfg.get("st_period", 10))
+            st_mult = float(cfg.get("st_mult", 3.0))
+            failed = False
+            if cfg.get("st_3m", False) and not supertrend_bullish(m3_candles, st_per, st_mult):
+                failed = True
+            if not failed and cfg.get("st_5m", True) and not supertrend_bullish(m5, st_per, st_mult):
+                failed = True
+            if not failed and cfg.get("st_15m", True) and not supertrend_bullish(m15, st_per, st_mult):
+                failed = True
+            if failed:
+                with _filter_lock: _filter_counts["f13_st"] = _filter_counts.get("f13_st", 0) + 1
+                return None
+
+        # ── F14 — Lux / UAlgo Trend Signals (per selected timeframes) ─────────
+        if cfg.get("use_lux", False):
+            lux_mult   = float(cfg.get("lux_mult", 2.0))
+            lux_atr_p  = int(cfg.get("lux_atr_period", 14))
+            failed = False
+            if cfg.get("lux_3m", False) and not lux_trend_bullish(m3_candles, lux_mult, lux_atr_p):
+                failed = True
+            if not failed and cfg.get("lux_5m", True) and not lux_trend_bullish(m5, lux_mult, lux_atr_p):
+                failed = True
+            if not failed and cfg.get("lux_15m", True) and not lux_trend_bullish(m15, lux_mult, lux_atr_p):
+                failed = True
+            if failed:
+                with _filter_lock: _filter_counts["f14_lux"] = _filter_counts.get("f14_lux", 0) + 1
+                return None
 
         tp  = round(entry * (1 + cfg["tp_pct"] / 100), 6)
         sl  = round(entry * (1 - cfg["sl_pct"] / 100), 6)
@@ -877,6 +1089,102 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Chandelier Exit Filter ────────────────────────────────────────────────
+    st.markdown("**🕯 F12 — Chandelier Exit**")
+    new_use_ce = st.checkbox(
+        "Enable Chandelier Exit filter",
+        value=bool(_snap_cfg.get("use_ce", False)),
+        key="cfg_use_ce",
+        help="Price must be in bullish Chandelier Exit state (long stop below price) on selected timeframes.",
+    )
+    if new_use_ce:
+        ce_tf1, ce_tf2, ce_tf3 = st.columns(3)
+        new_ce_3m  = ce_tf1.checkbox("3m",  value=bool(_snap_cfg.get("ce_3m",  False)), key="cfg_ce_3m")
+        new_ce_5m  = ce_tf2.checkbox("5m",  value=bool(_snap_cfg.get("ce_5m",  True)),  key="cfg_ce_5m")
+        new_ce_15m = ce_tf3.checkbox("15m", value=bool(_snap_cfg.get("ce_15m", True)),  key="cfg_ce_15m")
+        ce_p1, ce_p2 = st.columns(2)
+        new_ce_length = ce_p1.number_input(
+            "ATR Length", min_value=1, max_value=100, step=1,
+            value=int(_snap_cfg.get("ce_length", 22)), key="cfg_ce_length",
+        )
+        new_ce_mult = ce_p2.number_input(
+            "ATR Multiplier", min_value=0.1, max_value=10.0, step=0.1,
+            value=float(_snap_cfg.get("ce_mult", 3.0)), key="cfg_ce_mult",
+        )
+        st.caption(f"✅ CE bullish on: {'3m · ' if new_ce_3m else ''}{'5m · ' if new_ce_5m else ''}{'15m' if new_ce_15m else ''}".rstrip(" ·"))
+    else:
+        new_ce_3m = bool(_snap_cfg.get("ce_3m", False))
+        new_ce_5m = bool(_snap_cfg.get("ce_5m", True))
+        new_ce_15m = bool(_snap_cfg.get("ce_15m", True))
+        new_ce_length = int(_snap_cfg.get("ce_length", 22))
+        new_ce_mult = float(_snap_cfg.get("ce_mult", 3.0))
+
+    st.divider()
+
+    # ── SuperTrend Filter ─────────────────────────────────────────────────────
+    st.markdown("**📈 F13 — Classic SuperTrend**")
+    new_use_st = st.checkbox(
+        "Enable SuperTrend filter",
+        value=bool(_snap_cfg.get("use_st", False)),
+        key="cfg_use_st",
+        help="Price must be in bullish SuperTrend state (above ATR band) on selected timeframes.",
+    )
+    if new_use_st:
+        st_tf1, st_tf2, st_tf3 = st.columns(3)
+        new_st_3m  = st_tf1.checkbox("3m",  value=bool(_snap_cfg.get("st_3m",  False)), key="cfg_st_3m")
+        new_st_5m  = st_tf2.checkbox("5m",  value=bool(_snap_cfg.get("st_5m",  True)),  key="cfg_st_5m")
+        new_st_15m = st_tf3.checkbox("15m", value=bool(_snap_cfg.get("st_15m", True)),  key="cfg_st_15m")
+        st_p1, st_p2 = st.columns(2)
+        new_st_period = st_p1.number_input(
+            "ATR Period", min_value=1, max_value=100, step=1,
+            value=int(_snap_cfg.get("st_period", 10)), key="cfg_st_period",
+        )
+        new_st_mult = st_p2.number_input(
+            "ATR Multiplier", min_value=0.1, max_value=10.0, step=0.1,
+            value=float(_snap_cfg.get("st_mult", 3.0)), key="cfg_st_mult",
+        )
+        st.caption(f"✅ SuperTrend bullish on: {'3m · ' if new_st_3m else ''}{'5m · ' if new_st_5m else ''}{'15m' if new_st_15m else ''}".rstrip(" ·"))
+    else:
+        new_st_3m = bool(_snap_cfg.get("st_3m", False))
+        new_st_5m = bool(_snap_cfg.get("st_5m", True))
+        new_st_15m = bool(_snap_cfg.get("st_15m", True))
+        new_st_period = int(_snap_cfg.get("st_period", 10))
+        new_st_mult = float(_snap_cfg.get("st_mult", 3.0))
+
+    st.divider()
+
+    # ── Lux / UAlgo Trend Signals Filter ─────────────────────────────────────
+    st.markdown("**🌟 F14 — Lux / UAlgo Trend Signals**")
+    new_use_lux = st.checkbox(
+        "Enable Lux Trend filter",
+        value=bool(_snap_cfg.get("use_lux", False)),
+        key="cfg_use_lux",
+        help="Price must be in bullish UAlgo ATR trend state (sensitivity=2, ATR period=14) on selected timeframes.",
+    )
+    if new_use_lux:
+        lux_tf1, lux_tf2, lux_tf3 = st.columns(3)
+        new_lux_3m  = lux_tf1.checkbox("3m",  value=bool(_snap_cfg.get("lux_3m",  False)), key="cfg_lux_3m")
+        new_lux_5m  = lux_tf2.checkbox("5m",  value=bool(_snap_cfg.get("lux_5m",  True)),  key="cfg_lux_5m")
+        new_lux_15m = lux_tf3.checkbox("15m", value=bool(_snap_cfg.get("lux_15m", True)),  key="cfg_lux_15m")
+        lux_p1, lux_p2 = st.columns(2)
+        new_lux_mult = lux_p1.number_input(
+            "Sensitivity (Mult)", min_value=0.5, max_value=5.0, step=0.1,
+            value=float(_snap_cfg.get("lux_mult", 2.0)), key="cfg_lux_mult",
+        )
+        new_lux_atr_period = lux_p2.number_input(
+            "ATR Period", min_value=1, max_value=100, step=1,
+            value=int(_snap_cfg.get("lux_atr_period", 14)), key="cfg_lux_atr_period",
+        )
+        st.caption(f"✅ Lux trend bullish on: {'3m · ' if new_lux_3m else ''}{'5m · ' if new_lux_5m else ''}{'15m' if new_lux_15m else ''}".rstrip(" ·"))
+    else:
+        new_lux_3m = bool(_snap_cfg.get("lux_3m", False))
+        new_lux_5m = bool(_snap_cfg.get("lux_5m", True))
+        new_lux_15m = bool(_snap_cfg.get("lux_15m", True))
+        new_lux_mult = float(_snap_cfg.get("lux_mult", 2.0))
+        new_lux_atr_period = int(_snap_cfg.get("lux_atr_period", 14))
+
+    st.divider()
+
     # ── Execution ─────────────────────────────────────────────────────────────
     st.markdown("**⏱ Execution**")
     c5, c6 = st.columns(2)
@@ -986,6 +1294,27 @@ with st.sidebar:
             "use_vol_spike":      bool(new_use_vol_spike),
             "vol_spike_mult":     float(new_vol_mult),
             "vol_spike_lookback": int(new_vol_lookback),
+            # Chandelier Exit
+            "use_ce":             bool(new_use_ce),
+            "ce_length":          int(new_ce_length),
+            "ce_mult":            float(new_ce_mult),
+            "ce_3m":              bool(new_ce_3m),
+            "ce_5m":              bool(new_ce_5m),
+            "ce_15m":             bool(new_ce_15m),
+            # SuperTrend
+            "use_st":             bool(new_use_st),
+            "st_period":          int(new_st_period),
+            "st_mult":            float(new_st_mult),
+            "st_3m":              bool(new_st_3m),
+            "st_5m":              bool(new_st_5m),
+            "st_15m":             bool(new_st_15m),
+            # Lux / UAlgo
+            "use_lux":            bool(new_use_lux),
+            "lux_mult":           float(new_lux_mult),
+            "lux_atr_period":     int(new_lux_atr_period),
+            "lux_3m":             bool(new_lux_3m),
+            "lux_5m":             bool(new_lux_5m),
+            "lux_15m":            bool(new_lux_15m),
             "watchlist":          new_wl,
         }
         with _config_lock:
@@ -1045,6 +1374,15 @@ if _snap_cfg.get("use_macd"):      badges.append("📊 MACD 3m·5m·15m")
 if _snap_cfg.get("use_sar"):       badges.append("🪂 SAR 3m·5m·15m")
 if _snap_cfg.get("use_vol_spike"): badges.append(
     f"📦 Vol ≥{_snap_cfg.get('vol_spike_mult',2.0)}× / {_snap_cfg.get('vol_spike_lookback',20)} 15m candles")
+if _snap_cfg.get("use_ce"):
+    tfs = "·".join(t for t, k in [("3m","ce_3m"),("5m","ce_5m"),("15m","ce_15m")] if _snap_cfg.get(k))
+    badges.append(f"🕯 CE({_snap_cfg.get('ce_length',22)},{_snap_cfg.get('ce_mult',3.0)}) {tfs}")
+if _snap_cfg.get("use_st"):
+    tfs = "·".join(t for t, k in [("3m","st_3m"),("5m","st_5m"),("15m","st_15m")] if _snap_cfg.get(k))
+    badges.append(f"📈 ST({_snap_cfg.get('st_period',10)},{_snap_cfg.get('st_mult',3.0)}) {tfs}")
+if _snap_cfg.get("use_lux"):
+    tfs = "·".join(t for t, k in [("3m","lux_3m"),("5m","lux_5m"),("15m","lux_15m")] if _snap_cfg.get(k))
+    badges.append(f"🌟 Lux({_snap_cfg.get('lux_mult',2.0)},{_snap_cfg.get('lux_atr_period',14)}) {tfs}")
 if badges:
     st.caption("  |  ".join(badges))
 else:
